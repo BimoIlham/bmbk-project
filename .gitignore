@@ -1,0 +1,17 @@
+# Environment file (berisi kredensial, JANGAN commit)
+.env
+
+
+# Log files
+*.log
+
+# IDE/Editor
+.vscode/
+.idea/
+
+# Debug/scratch files
+scratch_*.php
+activities.md
+
+# Installer (sudah ada install.lock setelah setup)
+public/install.php

@@ -1,0 +1,126 @@
+-- ============================================================
+-- Strip Map Ruas Jalan - Database Schema
+-- ============================================================
+
+CREATE DATABASE IF NOT EXISTS `stripmap_db`
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
+
+USE `stripmap_db`;
+
+-- ------------------------------------------------------------
+-- Tabel: ruas_jalan
+-- Menyimpan data ruas jalan beserta STA awal/akhir
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `ruas_jalan` (
+    `id`         INT UNSIGNED    NOT NULL AUTO_INCREMENT,
+    `kode_ruas`  VARCHAR(50)     NOT NULL,
+    `nama_ruas`  VARCHAR(255)    NOT NULL,
+    `sta_awal`   DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'STA Awal dalam meter',
+    `sta_akhir`  DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'STA Akhir dalam meter',
+    `panjang`    DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'Panjang total dalam meter',
+    `koridor`    VARCHAR(100)    NULL COMMENT 'Koridor jalan',
+    `kabupaten_kota` VARCHAR(100) NULL COMMENT 'Kabupaten / Kota lokasi ruas',
+    `lat_awal`   DECIMAL(10,7)   NULL COMMENT 'Latitude titik awal ruas',
+    `lng_awal`   DECIMAL(10,7)   NULL COMMENT 'Longitude titik awal ruas',
+    `lat_akhir`  DECIMAL(10,7)   NULL COMMENT 'Latitude titik akhir ruas',
+    `lng_akhir`  DECIMAL(10,7)   NULL COMMENT 'Longitude titik akhir ruas',
+    `koordinat_json` LONGTEXT    NULL COMMENT 'Polyline rute jalan (array [lng,lat]) hasil impor KML/KMZ, format JSON',
+    `created_at` DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_kode_ruas` (`kode_ruas`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ------------------------------------------------------------
+-- Tabel: stripmap
+-- Menyimpan data strip map per segmen untuk setiap ruas (Kondisi Jalan)
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `stripmap` (
+    `id`            INT UNSIGNED    NOT NULL AUTO_INCREMENT,
+    `ruas_id`       INT UNSIGNED    NOT NULL,
+    `sta_awal`      DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'STA Awal segmen dalam meter',
+    `sta_akhir`     DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'STA Akhir segmen dalam meter',
+    `panjang`       DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'Panjang segmen dalam meter',
+    `baik`          DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'Panjang kondisi Baik (meter)',
+    `sedang`        DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'Panjang kondisi Sedang (meter)',
+    `rusak_ringan`  DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'Panjang kondisi Rusak Ringan (meter)',
+    `rusak_berat`   DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'Panjang kondisi Rusak Berat (meter)',
+    `created_at`    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (`id`),
+    KEY `idx_ruas_id` (`ruas_id`),
+
+    CONSTRAINT `fk_stripmap_ruas`
+        FOREIGN KEY (`ruas_id`)
+        REFERENCES `ruas_jalan` (`id`)
+        ON DELETE CASCADE
+        ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ------------------------------------------------------------
+-- Tabel: perkerasan
+-- Menyimpan data jenis perkerasan per segmen untuk setiap ruas
+-- (Rigid: Abu-abu, Aspal: Hitam, Agregat/Tanah: Coklat, Belum Tembus: Ungu)
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `perkerasan` (
+    `id`            INT UNSIGNED    NOT NULL AUTO_INCREMENT,
+    `ruas_id`       INT UNSIGNED    NOT NULL,
+    `sta_awal`      DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'STA Awal segmen dalam meter',
+    `sta_akhir`     DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'STA Akhir segmen dalam meter',
+    `panjang`       DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'Panjang segmen dalam meter',
+    `rigid`         DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'Panjang Rigid (meter)',
+    `aspal`         DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'Panjang Aspal (meter)',
+    `agregat_tanah` DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'Panjang Agregat / Tanah (meter)',
+    `belum_tembus`  DECIMAL(10,2)   NOT NULL DEFAULT 0.00 COMMENT 'Panjang Belum Tembus (meter)',
+    `created_at`    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (`id`),
+    KEY `idx_ruas_id` (`ruas_id`),
+
+    CONSTRAINT `fk_perkerasan_ruas`
+        FOREIGN KEY (`ruas_id`)
+        REFERENCES `ruas_jalan` (`id`)
+        ON DELETE CASCADE
+        ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ============================================================
+-- QUERY MIGRASI MANUAL (Jika tabel sudah ada di phpMyAdmin)
+-- ============================================================
+-- Copas query di bawah ini ke tab SQL database `stripmap_db` Anda:
+
+-- 1. Tambah kolom baru di ruas_jalan (jika belum):
+ALTER TABLE `ruas_jalan` ADD COLUMN `koridor` VARCHAR(100) NULL AFTER `panjang`;
+ALTER TABLE `ruas_jalan` ADD COLUMN `kabupaten_kota` VARCHAR(100) NULL AFTER `koridor`;
+
+-- 1b. Tambah kolom koordinat peta di ruas_jalan (jika belum):
+ALTER TABLE `ruas_jalan`
+    ADD COLUMN `lat_awal`  DECIMAL(10,7) NULL AFTER `kabupaten_kota`,
+    ADD COLUMN `lng_awal`  DECIMAL(10,7) NULL AFTER `lat_awal`,
+    ADD COLUMN `lat_akhir` DECIMAL(10,7) NULL AFTER `lng_awal`,
+    ADD COLUMN `lng_akhir` DECIMAL(10,7) NULL AFTER `lat_akhir`;
+
+-- 1c. Tambah kolom polyline rute hasil impor KML/KMZ (jika belum):
+ALTER TABLE `ruas_jalan` ADD COLUMN `koordinat_json` LONGTEXT NULL AFTER `lng_akhir`;
+
+-- 2. Buat tabel perkerasan:
+CREATE TABLE IF NOT EXISTS `perkerasan` (
+    `id`            INT UNSIGNED    NOT NULL AUTO_INCREMENT,
+    `ruas_id`       INT UNSIGNED    NOT NULL,
+    `sta_awal`      DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+    `sta_akhir`     DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+    `panjang`       DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+    `rigid`         DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+    `aspal`         DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+    `agregat_tanah` DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+    `belum_tembus`  DECIMAL(10,2)   NOT NULL DEFAULT 0.00,
+    `created_at`    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    KEY `idx_ruas_id` (`ruas_id`),
+    CONSTRAINT `fk_perkerasan_ruas` FOREIGN KEY (`ruas_id`) REFERENCES `ruas_jalan` (`id`) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

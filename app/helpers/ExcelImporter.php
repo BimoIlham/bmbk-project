@@ -68,6 +68,39 @@ class ExcelImporter
                     $zip->close();
                     return $result;
                 }
+                // Cek apakah format PKRMS (satu sheet, kolom M berisi kode A/B/K/T)
+                $singleSheetPath = null;
+                if (count($sheetMapping) === 1) {
+                    $singleSheetPath = reset($sheetMapping);
+                }
+                $sharedStringsForPkrms = [];
+                $ssXml = $zip->getFromName('xl/sharedStrings.xml');
+                if ($ssXml) {
+                    $ssObj = simplexml_load_string($ssXml);
+                    if ($ssObj) {
+                        foreach ($ssObj->children() as $si) {
+                            if ($si->getName() === 'si') {
+                                if (isset($si->t)) {
+                                    $sharedStringsForPkrms[] = (string)$si->t;
+                                } elseif (isset($si->r)) {
+                                    $txt = '';
+                                    foreach ($si->r as $r) { $txt .= (string)$r->t; }
+                                    $sharedStringsForPkrms[] = $txt;
+                                } else {
+                                    $sharedStringsForPkrms[] = '';
+                                }
+                            }
+                        }
+                    }
+                }
+                if ($singleSheetPath !== null) {
+                    $pkrmsRows = $this->parseWorksheet($zip, $singleSheetPath, $sharedStringsForPkrms);
+                    if ($this->isPkrmsFormat($pkrmsRows)) {
+                        $result = $this->importPkrmsFormat($pkrmsRows);
+                        $zip->close();
+                        return $result;
+                    }
+                }
                 $zip->close();
             }
         }
@@ -1009,6 +1042,274 @@ class ExcelImporter
             'success' => true,
             'message' => "Berhasil mengimpor detail survey ruas jalan {$kodeRuas} ({$namaRuas}) sebanyak {$insertedCount} segmen.",
             'count'   => $insertedCount
+        ];
+    }
+
+    // ============================================================
+    // FORMAT PKRMS — Handler khusus file FormPkrms-*.xlsx
+    // ============================================================
+    // Format: 1 sheet, baris 5 = header (NOMOR RUAS, NAMA RUAS,
+    // PATOK KM/STA Awal, STA Akhir, PANJANG, BAIK, SEDANG,
+    // RUSAK RINGAN, RUSAK BERAT, MANTAP, TIDAK MANTAP,
+    // JENIS PENANGANAN, JENIS PERKERASAN (A/B/K/T), LEBAR)
+    // Kolom: A=0, B=1, C=2, D=3, E=4, F=5, G=6, H=7, I=8,
+    //        J=9, K=10, L=11, M=12, N=13
+    // ============================================================
+
+    /**
+     * Deteksi apakah baris-baris yang diberikan merupakan format PKRMS.
+     * Ciri khas: baris header (biasanya row 5) mengandung "NOMOR RUAS" dan
+     * "NAMA RUAS" di kolom A-B, serta ada kolom "STA Awal"/"STA Akhir" dan
+     * salah satu baris data kolom M berisi kode perkerasan huruf (A/B/K/T).
+     */
+    private function isPkrmsFormat(array $rows): bool
+    {
+        // Cek baris header (row 5, indeks 5 dalam array rows keyed by row number)
+        $headerRow = null;
+        foreach ([5, 4, 6] as $rNum) {
+            if (isset($rows[$rNum])) {
+                $headerRow = $rows[$rNum];
+                break;
+            }
+        }
+        if ($headerRow === null) return false;
+
+        $headerStr = strtolower(implode(' ', $headerRow));
+        // Harus ada "nomor ruas" (atau "no.") dan "nama ruas" dan "patok km" / "sta awal"
+        $hasNomorRuas = str_contains($headerStr, 'nomor ruas') || str_contains($headerStr, 'no. ruas');
+        $hasNamaRuas  = str_contains($headerStr, 'nama ruas');
+        $hasStaOrPatok = str_contains($headerStr, 'patok km') || str_contains($headerStr, 'sta awal');
+
+        if (!$hasNomorRuas || !$hasNamaRuas || !$hasStaOrPatok) {
+            return false;
+        }
+
+        // Verifikasi: ada baris data yang kolom M (indeks 12) berisi kode A/B/K/T
+        foreach ($rows as $rNum => $rData) {
+            if ($rNum <= 6) continue; // Lewati baris header
+            if (!isset($rData[12])) continue;
+            $mVal = strtoupper(trim((string)$rData[12]));
+            if (in_array($mVal, ['A', 'B', 'K', 'T'], true)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Import format PKRMS (FormPkrms-*.xlsx).
+     *
+     * Setiap baris data adalah segmen 100m dengan:
+     *   A (0)  = Nomor/Kode Ruas
+     *   B (1)  = Nama Ruas
+     *   C (2)  = STA Awal (meter, disimpan langsung sebagai angka)
+     *   D (3)  = STA Akhir (meter)
+     *   E (4)  = Panjang (meter)
+     *   F (5)  = Baik (meter)
+     *   G (6)  = Sedang (meter)
+     *   H (7)  = Rusak Ringan (meter)
+     *   I (8)  = Rusak Berat (meter)
+     *   J (9)  = Mantap (formula, diabaikan)
+     *   K (10) = Tidak Mantap (formula, diabaikan)
+     *   L (11) = Jenis Penanganan (diabaikan)
+     *   M (12) = Jenis Perkerasan: A=Aspal, B=Beton/Rigid, K=Kerikil/Agregat, T=Tanah/Agregat
+     *   N (13) = Lebar (diabaikan)
+     *
+     * Strategi penyimpanan:
+     *   Setiap baris Excel (segmen ~100m) disimpan sebagai 1 baris TERPISAH
+     *   di tabel stripmap DAN perkerasan (bukan dijumlah/direkap).
+     */
+    private function importPkrmsFormat(array $rows): array
+    {
+        $ruasService       = new RuasService();
+        $stripmapService   = new StripmapService();
+        $perkerasanService = new PerkerasanService();
+
+        // Kumpulkan semua segmen per kode ruas
+        // Struktur: $ruasData[$kodeRuas] = [
+        //   'nama_ruas' => string,
+        //   'segments'  => [[sta_awal, sta_akhir, panjang, baik, sedang, rr, rb, perkerasan_kode], ...]
+        // ]
+        $ruasData = [];
+
+        foreach ($rows as $rNum => $rData) {
+            // Lewati baris header (baris 1-6)
+            if ($rNum <= 6) continue;
+
+            $kodeRuasRaw = trim((string)($rData[0] ?? ''));
+            $namaRuas    = trim((string)($rData[1] ?? ''));
+
+            // Lewati baris kosong atau baris yang bukan data
+            if (empty($kodeRuasRaw) || empty($namaRuas)) continue;
+            if (!is_numeric($kodeRuasRaw) && !preg_match('/^\d{3}/', $kodeRuasRaw)) continue;
+            if (preg_match('/nmr|kode|nomor|nama/i', $kodeRuasRaw)) continue;
+
+            $staAwalVal  = trim((string)($rData[2] ?? ''));
+            $staAkhirVal = trim((string)($rData[3] ?? ''));
+
+            if (!is_numeric($staAwalVal) || !is_numeric($staAkhirVal)) continue;
+
+            $staAwal  = (float)$staAwalVal;
+            $staAkhir = (float)$staAkhirVal;
+            $panjang  = $staAkhir - $staAwal;
+
+            if ($panjang <= 0) continue;
+
+            $baik   = $this->parseFloatVal((string)($rData[5] ?? '0'));
+            $sedang = $this->parseFloatVal((string)($rData[6] ?? '0'));
+            $rr     = $this->parseFloatVal((string)($rData[7] ?? '0'));
+            $rb     = $this->parseFloatVal((string)($rData[8] ?? '0'));
+
+            // Jika semua kondisi 0, gunakan panjang sebagai Baik (default)
+            if (($baik + $sedang + $rr + $rb) <= 0) {
+                $baik = $panjang;
+            }
+
+            // Kode perkerasan di kolom M (indeks 12)
+            $perkerasanKode = strtoupper(trim((string)($rData[12] ?? '')));
+
+            $kodeRuas = $this->formatKodeRuas($kodeRuasRaw);
+
+            if (!isset($ruasData[$kodeRuas])) {
+                $ruasData[$kodeRuas] = [
+                    'nama_ruas' => $namaRuas,
+                    'segments'  => [],
+                ];
+            }
+
+            $ruasData[$kodeRuas]['segments'][] = [
+                'sta_awal'       => $staAwal,
+                'sta_akhir'      => $staAkhir,
+                'panjang'        => $panjang,
+                'baik'           => $baik,
+                'sedang'         => $sedang,
+                'rr'             => $rr,
+                'rb'             => $rb,
+                'perkerasan_kode'=> $perkerasanKode,
+            ];
+        }
+
+        if (empty($ruasData)) {
+            return [
+                'success' => false,
+                'message' => 'Tidak ada data segmen yang dapat dibaca dari file PKRMS.',
+                'count'   => 0,
+            ];
+        }
+
+        $processedCount = 0;
+        $errors = [];
+
+        foreach ($ruasData as $kodeRuas => $info) {
+            $namaRuas  = $info['nama_ruas'];
+            $segments  = $info['segments'];
+
+            if (empty($segments)) continue;
+
+            // Hitung total panjang ruas dari seluruh segmen (untuk update tabel ruas)
+            $totalPanjang = array_sum(array_column($segments, 'panjang'));
+
+            $kabupatenKota = $this->extractKabupatenKota($namaRuas);
+
+            // Upsert ruas jalan
+            $existingRuas = $ruasService->findByKode($kodeRuas);
+            $ruasInsertData = [
+                'kode_ruas'     => $kodeRuas,
+                'nama_ruas'     => $namaRuas,
+                'sta_awal'      => 0,
+                'sta_akhir'     => $totalPanjang,
+                'panjang'       => $totalPanjang,
+                'kabupaten_kota'=> $kabupatenKota ?? ($existingRuas['kabupaten_kota'] ?? null),
+                'koridor'       => $existingRuas['koridor'] ?? null,
+            ];
+
+            if ($existingRuas) {
+                $ruasId = (int)$existingRuas['id'];
+                $ruasService->update($ruasId, $ruasInsertData);
+            } else {
+                $createRes = $ruasService->create($ruasInsertData);
+                if (!$createRes['success']) {
+                    $errors[] = "Gagal membuat ruas {$kodeRuas}: " . $createRes['message'];
+                    continue;
+                }
+                $ruasId = (int)$createRes['id'];
+            }
+
+            // Hapus data lama
+            $stripmapService->deleteByRuasId($ruasId);
+            $perkerasanService->deleteByRuasId($ruasId);
+
+            // ── Bulk INSERT langsung via PDO (bypass batchCreate untuk performa) ─
+            // batchCreate memvalidasi & insert satu per satu → sangat lambat untuk
+            // 17.000+ baris PKRMS. Di sini data sudah bersih (dari Excel resmi),
+            // jadi langsung prepared statement dengan transaction.
+            $db = Database::getInstance()->getConnection();
+            $db->beginTransaction();
+            try {
+                $stmtSm = $db->prepare(
+                    "INSERT INTO stripmap (ruas_id, sta_awal, sta_akhir, panjang, baik, sedang, rusak_ringan, rusak_berat)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                );
+                $stmtPk = $db->prepare(
+                    "INSERT INTO perkerasan (ruas_id, sta_awal, sta_akhir, panjang, rigid, aspal, agregat_tanah, belum_tembus)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                );
+
+                foreach ($segments as $seg) {
+                    $panjangSeg = $seg['panjang'];
+
+                    // Stripmap — 1 baris per segmen
+                    $stmtSm->execute([
+                        $ruasId,
+                        $seg['sta_awal'],
+                        $seg['sta_akhir'],
+                        $panjangSeg,
+                        round($seg['baik'],   2),
+                        round($seg['sedang'], 2),
+                        round($seg['rr'],     2),
+                        round($seg['rb'],     2),
+                    ]);
+
+                    // Perkerasan — 1 baris per segmen, sesuai kode M
+                    // A=Aspal, B=Beton/Rigid, K=Kerikil/Agregat, T=Tanah/Agregat
+                    $kode       = $seg['perkerasan_kode'];
+                    $rigidSeg   = ($kode === 'B')                  ? $panjangSeg : 0;
+                    $aspalSeg   = ($kode === 'A')                  ? $panjangSeg : 0;
+                    $agregatSeg = ($kode === 'K' || $kode === 'T') ? $panjangSeg : 0;
+
+                    if ($kode !== '') {
+                        $stmtPk->execute([
+                            $ruasId,
+                            $seg['sta_awal'],
+                            $seg['sta_akhir'],
+                            $panjangSeg,
+                            $rigidSeg,
+                            $aspalSeg,
+                            $agregatSeg,
+                            0, // belum_tembus
+                        ]);
+                    }
+                }
+
+                $db->commit();
+            } catch (\Throwable $e) {
+                $db->rollBack();
+                $errors[] = "Ruas {$kodeRuas}: Gagal insert segmen — " . $e->getMessage();
+                continue;
+            }
+
+            // Sinkronkan STA ruas dari segmen yang tersimpan
+            $ruasService->syncStaFromStripmap($ruasId);
+            $processedCount++;
+        }
+
+
+        return [
+            'success' => $processedCount > 0,
+            'message' => "[PKRMS] Berhasil mengimpor {$processedCount} ruas jalan dengan data per-segmen 100m.",
+            'count'   => $processedCount,
+            'errors'  => $errors,
         ];
     }
 
